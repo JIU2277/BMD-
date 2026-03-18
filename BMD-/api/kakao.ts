@@ -1,8 +1,9 @@
 export const runtime = 'nodejs';
 
-const GEMINI_MODEL = 'gemini-2.0-flash';
+const PRIMARY_MODEL = 'gemini-2.5-flash';
+const FALLBACK_MODEL = 'gemini-2.5-flash-lite';
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
-const REQUEST_TIMEOUT_MS = 2500;
+const REQUEST_TIMEOUT_MS = 2200;
 const MAX_OUTPUT_CHARS = 320;
 
 function kakaoSimpleText(text: string) {
@@ -27,61 +28,99 @@ function clampText(input: string, maxLength = MAX_OUTPUT_CHARS) {
   return `${normalized.slice(0, maxLength - 3).trimEnd()}...`;
 }
 
-async function askGemini(utterance: string, apiKey: string) {
+function buildGeminiBody(utterance: string) {
+  return {
+    systemInstruction: {
+      parts: [
+        {
+          text: '한국어로 짧고 정확하게 답하세요. 핵심만 말하고, 최대 5문장.',
+        },
+      ],
+    },
+    contents: [
+      {
+        role: 'user',
+        parts: [
+          {
+            text: utterance.slice(0, 800),
+          },
+        ],
+      },
+    ],
+    generationConfig: {
+      temperature: 0.3,
+      maxOutputTokens: 220,
+    },
+  };
+}
+
+function isResourceExhausted(status: number, data: any, rawText: string) {
+  const apiCode = data?.error?.code;
+  const apiStatus = data?.error?.status;
+  const message = String(data?.error?.message || rawText || '').toLowerCase();
+
+  return (
+    status === 429 ||
+    apiCode === 429 ||
+    apiStatus === 'RESOURCE_EXHAUSTED' ||
+    message.includes('resource has been exhausted') ||
+    message.includes('quota') ||
+    message.includes('rate limit') ||
+    message.includes('too many requests')
+  );
+}
+
+async function callGeminiModel(model: string, utterance: string, apiKey: string) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
 
   try {
     const response = await fetch(
-      `${GEMINI_API_BASE}/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(apiKey)}`,
+      `${GEMINI_API_BASE}/${model}:generateContent?key=${encodeURIComponent(apiKey)}`,
       {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         signal: controller.signal,
-        body: JSON.stringify({
-          systemInstruction: {
-            parts: [
-              {
-                text: '한국어로 짧고 정확하게 답하세요. 보통 1~2문단, 최대 5문장.',
-              },
-            ],
-          },
-          contents: [
-            {
-              role: 'user',
-              parts: [
-                {
-                  text: utterance.slice(0, 800),
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            temperature: 0.3,
-            maxOutputTokens: 220,
-          },
-        }),
+        body: JSON.stringify(buildGeminiBody(utterance)),
       }
     );
 
-    if (!response.ok) {
-      throw new Error(`Gemini API error: ${response.status}`);
+    const rawText = await response.text();
+
+    let data: any = null;
+    try {
+      data = rawText ? JSON.parse(rawText) : null;
+    } catch {
+      data = null;
     }
 
-    const data = (await response.json()) as {
-      candidates?: Array<{
-        content?: {
-          parts?: Array<{ text?: string }>;
-        };
-      }>;
-    };
+    if (!response.ok) {
+      const error = new Error(
+        `Gemini API error: ${response.status} ${data?.error?.status || ''}`.trim()
+      ) as Error & {
+        httpStatus?: number;
+        apiData?: any;
+        rawText?: string;
+        model?: string;
+        resourceExhausted?: boolean;
+      };
 
-    const parts = data.candidates?.[0]?.content?.parts ?? [];
-    const text = parts.map((part) => part.text ?? '').join('\n').trim();
+      error.httpStatus = response.status;
+      error.apiData = data;
+      error.rawText = rawText;
+      error.model = model;
+      error.resourceExhausted = isResourceExhausted(response.status, data, rawText);
+
+      throw error;
+    }
+
+    const parts = data?.candidates?.[0]?.content?.parts ?? [];
+    const text = parts.map((part: { text?: string }) => part.text ?? '').join('\n').trim();
+
     if (!text) {
-      throw new Error('Gemini returned empty text');
+      throw new Error(`Gemini returned empty text from ${model}`);
     }
 
     return clampText(text);
@@ -90,11 +129,36 @@ async function askGemini(utterance: string, apiKey: string) {
   }
 }
 
+async function askGemini(utterance: string, apiKey: string) {
+  try {
+    return await callGeminiModel(PRIMARY_MODEL, utterance, apiKey);
+  } catch (error: any) {
+    const shouldFallback = Boolean(error?.resourceExhausted);
+
+    if (!shouldFallback) {
+      throw error;
+    }
+
+    console.warn(
+      `Primary model exhausted. Falling back from ${PRIMARY_MODEL} to ${FALLBACK_MODEL}.`,
+      {
+        httpStatus: error?.httpStatus,
+        apiStatus: error?.apiData?.error?.status,
+        message: error?.apiData?.error?.message || error?.message,
+      }
+    );
+
+    return await callGeminiModel(FALLBACK_MODEL, utterance, apiKey);
+  }
+}
+
 export default async function handler(req: any, res: any) {
   if (req.method === 'GET') {
     return res.status(200).json({
       ok: true,
       service: 'kakao-gemini-skill',
+      primaryModel: PRIMARY_MODEL,
+      fallbackModel: FALLBACK_MODEL,
       timestamp: new Date().toISOString(),
     });
   }
